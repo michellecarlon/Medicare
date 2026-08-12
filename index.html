@@ -1,0 +1,976 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Medicare Claims In-Sourcing — PRD v0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="sidebar">
+  <div class="sidebar-top">
+    <div class="sidebar-brand">Medicare In-Sourcing</div>
+    <div class="sidebar-meta">PRD v0 &middot; Draft &middot; Q4 2026</div>
+  </div>
+  <ul class="nav-list">
+    <li><a href="#tldr" class="nav-link">TL;DR</a></li>
+    <li><a href="#lifecycle" class="nav-link">Claim lifecycle</a></li>
+    <li><a href="#problem" class="nav-link">Problem</a></li>
+    <li><a href="#goals" class="nav-link">Goals</a></li>
+    <li><a href="#users" class="nav-link">Users &amp; Stories</a></li>
+    <li><a href="#current-state" class="nav-link">Current State</a></li>
+    <li class="nav-group-label">Requirements</li>
+    <li><a href="#req-a" class="nav-link nav-sub">A. Backoffice Fields</a></li>
+    <li><a href="#req-b" class="nav-link nav-sub">B. ERA Ingestion</a></li>
+    <li><a href="#req-c" class="nav-link nav-sub">C. COB / Secondary Claims</a></li>
+    <li><a href="#req-d" class="nav-link nav-sub">D. Rate Table</a></li>
+    <li><a href="#req-e" class="nav-link nav-sub">E. Medicaid Block</a></li>
+    <li><a href="#req-f" class="nav-link nav-sub">F. Balance Reconciliation</a></li>
+    <li><a href="#req-g" class="nav-link nav-sub">G. Backoffice UI</a></li>
+    <li><a href="#happy-paths" class="nav-link">Happy Paths</a></li>
+    <li><a href="#config" class="nav-link">Configuration</a></li>
+    <li><a href="#metrics" class="nav-link">Success Metrics</a></li>
+    <li><a href="#phasing" class="nav-link">Phasing</a></li>
+    <li><a href="#risks" class="nav-link">Risks</a></li>
+    <li><a href="#open-questions" class="nav-link">Open Questions</a></li>
+    <li><a href="#decisions" class="nav-link">Decisions Log</a></li>
+  </ul>
+</nav>
+
+<main class="content">
+
+  <!-- Document header -->
+  <div class="doc-header">
+    <div class="doc-meta-row">
+      <span class="doc-status">Draft</span>
+      <span class="doc-date">2026-07-02</span>
+      <span class="doc-author">Michelle Carlon + Claude</span>
+    </div>
+    <h1>Medicare Claims In-Sourcing</h1>
+    <p class="doc-sub">Replace Advantum/Tebra with in-house Medicare Claim submission, ERA processing, Coordination of Benefits, locality-based rates, and a Medicaid billing block &mdash; targeting Q4 2026 for Q1 2027 readiness.</p>
+    <div class="doc-scope-pills">
+      <span class="pill pill-teal">Population: Medicare members</span>
+      <span class="pill pill-teal">Target: Q4 2026</span>
+      <span class="pill pill-muted">Clearinghouse: Trizetto (unchanged)</span>
+    </div>
+  </div>
+
+  <!-- Phase overview -->
+  <div class="phase-bar">
+    <div class="phase-chip phase-v1">
+      <div class="phase-label">v1 — Ship first</div>
+      <div class="phase-items">ERA processing &middot; COB claim lifecycle &middot; Backoffice fields (billed amount + secondary fields) &middot; Locality rate table &middot; Flag member as Medicaid &middot; Manual Stripe invoicing &middot; Full A/R reporting (takebacks, refunds, overpayment detection)</div>
+    </div>
+    <div class="phase-chip phase-v2">
+      <div class="phase-label">Later phases</div>
+      <div class="phase-items">Eligibility verification on secondary &middot; Member-facing billing center &middot; Auto Stripe invoicing &middot; Auto Medicaid billing block &middot; SOX rate update workflow &middot; Multi-policy support (primary Medicare + secondary + supplemental)</div>
+    </div>
+  </div>
+
+  <!-- TL;DR -->
+  <section id="tldr" class="prd-section">
+    <h2>TL;DR</h2>
+    <p>Talkspace pays Advantum to run Medicare claims through Tebra/Trizetto. Advantum submits claims, receives ERAs, tracks secondary/supplemental claims, posts payments, and invoices members via Stripe. Talkspace receives ERAs but does not process them — there is no ERA-to-claim association in the TS system today, no visibility into secondary claim status, and no locality-based rate logic.</p>
+    <p>We will:</p>
+    <ol class="goal-list">
+      <li><strong>Ingest and process Medicare ERAs</strong> inside the TS claims system. Associate primary and secondary ERA data to the originating claim and expose it in backoffice.</li>
+      <li><strong>Manage Coordination of Benefits (COB)</strong> — create and submit secondary/supplemental claims triggered by primary ERA outcome (autoforward detected, or secondary on file with no autoforward).</li>
+      <li><strong>Apply locality-based Medicare rates</strong> from a master rate table, using provider home zip code to determine the correct allowed amount for each claim.</li>
+    </ol>
+    <div class="callout callout-success">
+      <strong>Net effect</strong> Advantum is fully replaced for Medicare claims. Rev Ops gains real-time visibility into claim status, ERA associations, and member balances for both primary and secondary insurance. One vendor relationship is eliminated and one Rev Ops FTE currently absorbed by Advantum is redirected to managing the process in-house.
+    </div>
+  </section>
+
+  <!-- Claim lifecycle -->
+  <section id="lifecycle" class="prd-section">
+    <h2>Claim lifecycle</h2>
+
+    <h3>Primary claim path (standard)</h3>
+    <div class="flow-steps">
+      <div class="flow-step">
+        <div class="flow-step-icon">📋</div>
+        <div class="flow-step-body">
+          <div class="flow-step-label">Session complete</div>
+          <div class="flow-step-desc">Provider submits session</div>
+        </div>
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step">
+        <div class="flow-step-icon">📤</div>
+        <div class="flow-step-body">
+          <div class="flow-step-label">Claim sent to Trizetto</div>
+          <div class="flow-step-desc">TS submits claim to the state level payer ID at billed amount $224.46 and associates locality rate to the claim</div>
+        </div>
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step">
+        <div class="flow-step-icon">📥</div>
+        <div class="flow-step-body">
+          <div class="flow-step-label">MAC returns ERA</div>
+          <div class="flow-step-desc">14–30 days later</div>
+        </div>
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step">
+        <div class="flow-step-icon">✅</div>
+        <div class="flow-step-body">
+          <div class="flow-step-label">Backoffice updated</div>
+          <div class="flow-step-desc">Allowed Amt, primary paid, claim status, ERA ID stored</div>
+        </div>
+      </div>
+    </div>
+
+    <h3>ERA outcome branches</h3>
+    <div class="era-branches">
+      <div class="era-branch">
+        <div class="era-branch-status"><span class="era-code">PROCESSED_AS_PRIMARY</span></div>
+        <ul class="era-branch-steps">
+          <li>Record payment</li>
+          <li>Check for secondary insurance on file</li>
+          <li>If secondary exists → auto submit secondary claim</li>
+          <li>Member owes remainder</li>
+        </ul>
+      </div>
+      <div class="era-branch">
+        <div class="era-branch-status"><span class="era-code">PROCESSED_AS_PRIMARY_FORWARDED</span></div>
+        <ul class="era-branch-steps">
+          <li>Record payment</li>
+          <li>Mark claim autoforwarded</li>
+          <li>Create record of secondary claim</li>
+          <li>Await secondary ERA</li>
+          <li>Update secondary fields on receipt</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Problem -->
+  <section id="problem" class="prd-section">
+    <h2>Problem</h2>
+    <p>Today, the TS claims system has no Medicare-specific logic and no ERA processing. The following gaps exist:</p>
+    <div class="gap-list">
+      <div class="gap-item">
+        <div class="gap-icon">⚠️</div>
+        <div class="gap-body"><strong>No ERA-to-claim association.</strong> ERAs arrive and are forwarded to Tebra; they are stored but not linked to a claim record in the TS database. Rev Ops cannot see ERA data in backoffice without going to Tebra.</div>
+      </div>
+      <div class="gap-item">
+        <div class="gap-icon">⚠️</div>
+        <div class="gap-body"><strong>No secondary claim visibility.</strong> Secondary / supplemental claims are created and managed entirely in Tebra. TS has no record of secondary claim status, secondary payments, or secondary ERA outcomes.</div>
+      </div>
+      <div class="gap-item">
+        <div class="gap-icon">⚠️</div>
+        <div class="gap-body"><strong>No Coordination of Benefits logic.</strong> TS cannot detect when a primary ERA indicates autoforward, cannot trigger a secondary claim, and cannot create a claim for a secondary payer on behalf of a member who has supplemental or secondary insurance.</div>
+      </div>
+      <div class="gap-item">
+        <div class="gap-icon">⚠️</div>
+        <div class="gap-body"><strong>No locality-based rates.</strong> Every claim is submitted at $224.46 regardless of the MAC jurisdiction. The correct allowed amount varies by locality. TS should add the true local rate for proper A/R reporting.</div>
+      </div>
+      <div class="gap-item">
+        <div class="gap-icon">⚠️</div>
+        <div class="gap-body"><strong>No A/R reporting.</strong> TS has no Medicare-specific accounts receivable visibility. Takebacks, refunds, overpayments, and multi-payment histories are not tracked in the TS system. Rev Ops cannot see the financial state of the Medicare book of business without going to Tebra.</div>
+      </div>
+      <div class="gap-item">
+        <div class="gap-icon">⚠️</div>
+        <div class="gap-body"><strong>No Medicaid/DUALS detection.</strong> Members with Medicaid as secondary (DUALS) must never be billed out-of-pocket. Today there is no automated detection; Rev Ops has no flag in backoffice to indicate that a member should not be invoiced, making this a manual process and a compliance risk.</div>
+      </div>
+      <div class="gap-item">
+        <div class="gap-icon">⚠️</div>
+        <div class="gap-body"><strong>Member balance not updated from ERA outcomes.</strong> When Medicare pays and a secondary payer pays, the member's balance in backoffice is not reconciled automatically. Rev Ops manually posts payments.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Goals -->
+  <section id="goals" class="prd-section">
+    <h2>Goals <span class="scope-tag">v1</span></h2>
+    <ol class="goal-list">
+      <li><strong>ERA processing:</strong> Every Medicare ERA (primary and secondary/supplemental) is processed into the TS system and associated to the originating claim in the database.</li>
+      <li><strong>COB / secondary claims:</strong> TS creates and submits secondary/supplemental claims triggered by primary ERA outcome (autoforward detected, or secondary on file with no autoforward). Add the ability to manually generate claims out of backoffice.</li>
+      <li><strong>Locality rates:</strong> All Medicare claims are submitted at the standard billed amount, but the system tracks the locality-specific allowed amount based on provider home zip code.</li>
+      <li><strong>Medicaid detection &amp; block:</strong> Members identified as Medicaid or DUALS are flagged in backoffice. They will never be invoiced via Stripe. The flag is applied automatically from remark codes and can be set manually at the insurance or patient level.</li>
+      <li><strong>Backoffice visibility:</strong> Rev Ops can view and manage all Medicare claim fields — primary and secondary — in backoffice without leaving the TS system. Rev Ops can manually post ERAs and tag them as primary or secondary.</li>
+      <li><strong>A/R reporting:</strong> Full Medicare-specific accounts receivable visibility in TS, including takebacks, refunds, overpayment detection, and multi-payment history.</li>
+    </ol>
+
+    <h3>Non-Goals <span class="scope-tag scope-tag-muted">v1</span></h3>
+    <ul class="non-goal-list">
+      <li>Client-facing secondary insurance add/update — deferred to later phases</li>
+      <li>Automated Stripe invoicing on claim outcome — deferred to later phases (Rev Ops manually invoices in v1)</li>
+      <li>SOX-process tooling for biannual CMS rate updates — deferred to later phases; interim process is manual with Rev Ops ownership</li>
+      <li>Eligibility verification on secondary policies — deferred to later phases</li>
+      <li>Non-Medicare payers — rate table infrastructure benefits BCBS and TRICARE but payer-specific logic is out of v1 scope</li>
+    </ul>
+  </section>
+
+  <!-- Users & Stories -->
+  <section id="users" class="prd-section">
+    <h2>Users &amp; Stories</h2>
+
+    <div class="user-group">
+      <h3>Rev Ops</h3>
+      <ul class="story-list">
+        <li>As a <strong>Rev Ops analyst</strong>, I want to see primary and secondary ERA data associated to each claim in backoffice, so that I can verify payment without logging into Tebra.</li>
+        <li>As a <strong>Rev Ops analyst</strong>, I want the system to automatically create and submit a secondary claim when a primary ERA indicates autoforward or when a secondary insurance is on file, so that I only intervene for exception cases.</li>
+        <li>As a <strong>Rev Ops analyst</strong>, I want to manually submit a secondary claim from backoffice when the automatic path doesn't apply, so that I have a fallback for edge cases without going to a vendor system.</li>
+        <li>As a <strong>Rev Ops analyst</strong>, I want to view and edit a member's secondary insurance in backoffice, so that I can correct data without requiring the member to update it themselves.</li>
+        <li>As a <strong>Rev Ops analyst</strong>, I want the member balance to reflect both primary and secondary payments once ERAs are processed, so that I know the correct amount to invoice the member (if any).</li>
+        <li>As a <strong>Rev Ops lead</strong>, I want a backoffice filter for all Medicare payers, so that I can monitor the Medicare book of business without custom SQL.</li>
+        <li>As a <strong>Rev Ops lead</strong>, I want the system to alert me when an ERA returns an allowed amount higher than the net revenue (locality rate), so that I can initiate a rate review before the variance compounds.</li>
+      </ul>
+    </div>
+
+    <div class="user-group">
+      <h3>Member (Medicare)</h3>
+      <ul class="story-list">
+        <li>As a <strong>Medicare member</strong>, I want my Stripe invoice to reflect the correct amount after both Medicare and my supplemental insurance pay, so that I am not overbilled.</li>
+        <li>As a <strong>Medicare-Medicaid dual-eligible (DUALS) member</strong>, I want to never receive an invoice from Talkspace, so that I am not asked to pay a copay that regulations prohibit.</li>
+      </ul>
+    </div>
+
+    <div class="user-group">
+      <h3>Provider</h3>
+      <ul class="story-list">
+        <li>As a <strong>provider</strong>, I want my claims submitted at the correct locality-specific rate, so that my Medicare reimbursement is accurate for my jurisdiction.</li>
+      </ul>
+    </div>
+
+    <div class="user-group">
+      <h3>Engineering / Backoffice</h3>
+      <ul class="story-list">
+        <li>As an <strong>engineer</strong>, I want ERA data stored in a normalized, claim-associated table, so that downstream features (A/R reporting, balance reconciliation, secondary claim triggers) have a clean data source.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Current State -->
+  <section id="current-state" class="prd-section">
+    <h2>Current State</h2>
+    <table class="prd-table">
+      <thead>
+        <tr><th>Step</th><th>Today's actor</th><th>What happens</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Session complete</td><td>TS</td><td>Claim created in TS, submitted to Tebra under ELCMS legal entity with state, provider state facility</td></tr>
+        <tr><td>Claim submission</td><td>Tebra / Trizetto</td><td>Claim submitted at $224.46 to MAC; Tebra auto-updates to state-level payer ID</td></tr>
+        <tr><td>Primary ERA received</td><td>MAC → TS → Tebra</td><td>TS receives ERA, forwards to Tebra. Not parsed and associated to claims_submitted.</td></tr>
+        <tr><td>ERA processing</td><td>Tebra</td><td>Tebra records ERA outcome; assigns primary payment to patient record</td></tr>
+        <tr><td>Secondary claim</td><td>Tebra</td><td>Tebra tracks secondary/supplemental claims; submits to secondary payer</td></tr>
+        <tr><td>Secondary ERA / paper EOB</td><td>Advantum</td><td>If secondary payment arrives via lockbox, Advantum manually posts it</td></tr>
+        <tr><td>Secondary (Optum autoforward)</td><td>Tebra</td><td>Tebra receives autoforwarded secondary ERA from Optum; posts payment</td></tr>
+        <tr><td>Member invoicing</td><td>Tebra → Stripe</td><td>Tebra invoices member via Stripe; updates balance after Stripe payment</td></tr>
+        <tr><td>Denials / rejections</td><td>Advantum</td><td>Advantum works denials; TS has no visibility</td></tr>
+      </tbody>
+    </table>
+    <div class="callout callout-warning" style="margin-top:16px;">
+      <strong>Gap summary</strong> TS has zero visibility into ERA outcomes, secondary claim status, or member balance after Medicare pays. Every step after claim submission lives in Tebra/Advantum.
+    </div>
+  </section>
+
+  <!-- Requirements -->
+  <section class="prd-section">
+    <h2 id="requirements">Future State Requirements</h2>
+
+    <!-- A -->
+    <div id="req-a" class="req-block">
+      <div class="req-letter">A</div>
+      <div class="req-content">
+        <h3>New Backoffice Fields</h3>
+        <p>These fields are added to the claim / session record in backoffice. <span class="badge-new">new</span> if not currently tracked, <span class="badge-existing">existing</span> if the field exists but needs to be populated from ERA data.</p>
+        <table class="prd-table">
+          <thead>
+            <tr><th>Field</th><th>Type</th><th>Source</th><th>Notes</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Billed Amount</td>
+              <td>Currency</td>
+              <td>TS system</td>
+              <td>$224.46 today; remains fixed at billed charge regardless of locality rate</td>
+            </tr>
+            <tr>
+              <td>Net Revenue <span class="badge-existing">existing</span></td>
+              <td>Currency</td>
+              <td>TS rate table</td>
+              <td>Locality-specific rate; used for revenue reporting. This is the expected allowed amount.</td>
+            </tr>
+            <tr>
+              <td>Allowed Amount <span class="badge-existing">existing</span></td>
+              <td>Currency</td>
+              <td>Primary ERA</td>
+              <td>Returned by MAC. Alert Rev Ops if Allowed Amount &gt; Net Revenue. <span class="badge-new">new feature</span></td>
+            </tr>
+            <tr>
+              <td>Primary Insurance Paid <span class="badge-existing">existing</span></td>
+              <td>Currency</td>
+              <td>Primary ERA</td>
+              <td>Amount MAC paid</td>
+            </tr>
+            <tr>
+              <td>Secondary Insurance Paid <span class="badge-new">new</span></td>
+              <td>Currency</td>
+              <td>Secondary ERA</td>
+              <td>Amount secondary/supplemental paid; supports manual post</td>
+            </tr>
+            <tr>
+              <td>Refunds / Takebacks <span class="badge-new">new</span></td>
+              <td>Currency</td>
+              <td>ERA adjustment</td>
+              <td>Negative adjustments / payer recoupments</td>
+            </tr>
+            <tr>
+              <td>ERA ID — Primary <span class="badge-new">new</span></td>
+              <td>String</td>
+              <td>Primary ERA</td>
+              <td>ERA transaction identifier for reconciliation</td>
+            </tr>
+            <tr>
+              <td>ERA ID — Secondary <span class="badge-new">new</span></td>
+              <td>String</td>
+              <td>Secondary ERA</td>
+              <td>ERA transaction identifier for reconciliation</td>
+            </tr>
+            <tr>
+              <td>Claim Create Date — Secondary <span class="badge-new">new</span></td>
+              <td>Date</td>
+              <td>TS system</td>
+              <td>When TS created the secondary claim</td>
+            </tr>
+            <tr>
+              <td>Claim Submit Date — Secondary <span class="badge-new">new</span></td>
+              <td>Date</td>
+              <td>Trizetto</td>
+              <td>When secondary claim was transmitted to clearinghouse</td>
+            </tr>
+            <tr>
+              <td>Claim Status — Secondary <span class="badge-new">new</span></td>
+              <td>Enum</td>
+              <td>Secondary ERA</td>
+              <td><code>processing</code> &middot; <code>completed</code> &middot; <code>denied</code> &middot; <code>rejected</code></td>
+            </tr>
+            <tr>
+              <td>Adjustment Reason — Secondary <span class="badge-new">new</span></td>
+              <td>String</td>
+              <td>Secondary ERA</td>
+              <td>CARC code from secondary ERA</td>
+            </tr>
+            <tr>
+              <td>Remark Code — Secondary <span class="badge-new">new</span></td>
+              <td>String</td>
+              <td>Secondary ERA</td>
+              <td>RARC code; also used for Medicaid block trigger</td>
+            </tr>
+            <tr>
+              <td>Primary Claim Status <span class="badge-existing">existing</span></td>
+              <td>Enum</td>
+              <td>Primary ERA</td>
+              <td>Extend to support multiple statuses per claim</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout-info" style="margin-top:16px;">
+          <strong>Multiple payments per claim</strong> The infrastructure must support multiple payment records per claim (primary paid, secondary paid, primary recoupment, etc.). The scoping doc notes this infrastructure is partially in place.
+        </div>
+        <div class="callout callout-info">
+          <strong>Multiple claim statuses per session</strong> A single session may have status combinations — e.g., Primary: <code>completed</code>, Secondary: <code>denied</code>. Both states must be visible and independently updatable.
+        </div>
+      </div>
+    </div>
+
+    <!-- B -->
+    <div id="req-b" class="req-block">
+      <div class="req-letter">B</div>
+      <div class="req-content">
+        <h3>ERA Ingestion and Processing</h3>
+
+        <h4>Primary ERA ingestion</h4>
+        <ol>
+          <li>When a Medicare ERA is received by TS, store it in a new <code>claim_era</code> table linked to the originating claim by claim ID / external claim ID.</li>
+          <li>Parse and store: ERA ID, payer, payment date, allowed amount, paid amount, adjustment codes (CARC), remark codes (RARC), claim status code.</li>
+          <li>Update the claim record with: Allowed Amount, Primary Insurance Paid, ERA ID — Primary, Primary Claim Status.</li>
+          <li>Detect ERA status code to determine downstream routing:</li>
+        </ol>
+        <table class="prd-table">
+          <thead>
+            <tr><th>ERA Status</th><th>Action</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="era-code">PROCESSED_AS_PRIMARY</span></td>
+              <td>Record payment. Check for secondary insurance on member record. If secondary exists and ERA did not autoforward → trigger secondary claim submission (see Section C).</td>
+            </tr>
+            <tr>
+              <td><span class="era-code">PROCESSED_AS_PRIMARY_FORWARDED</span></td>
+              <td>Record payment. Mark claim as autoforwarded. Set Secondary Claim Status = <code>processing</code>. Await secondary ERA.</td>
+            </tr>
+            <tr>
+              <td><span class="era-code">PROCESSED_AS_SECONDARY</span></td>
+              <td>Record secondary payment. Update Secondary Insurance Paid, ERA ID — Secondary, Secondary Claim Status. Reconcile member balance.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h4>Secondary ERA ingestion</h4>
+        <ol>
+          <li>Match secondary ERA to the originating claim via external claim ID.</li>
+          <li>Store: ERA ID — Secondary, Secondary Claim Status, Adjustment Reason — Secondary, Remark Code — Secondary, Secondary Insurance Paid.</li>
+          <li>Trigger member balance reconciliation (see Section F).</li>
+        </ol>
+
+        <h4>Remark code monitoring</h4>
+        <ol>
+          <li>On any ERA (primary or secondary), scan RARC codes for Medicaid/DUALS indicators.</li>
+          <li>If detected, apply billing block (see Section E).</li>
+        </ol>
+      </div>
+    </div>
+
+    <!-- C -->
+    <div id="req-c" class="req-block">
+      <div class="req-letter">C</div>
+      <div class="req-content">
+        <h3>Coordination of Benefits — Secondary Claim Lifecycle</h3>
+        <p>Three paths for secondary claim submission:</p>
+
+        <div class="cob-path">
+          <div class="cob-path-header">
+            <span class="cob-path-num">Path 1</span>
+            <span class="cob-path-name">Autoforward detected</span>
+            <span class="era-code">PROCESSED_AS_PRIMARY_FORWARDED</span>
+          </div>
+          <ul>
+            <li>No secondary claim submission needed; MAC has forwarded to the secondary payer.</li>
+            <li>TS creates a record of the secondary claim and marks Secondary Claim Status = <code>processing</code>.</li>
+            <li>Await secondary ERA (Section B handles receipt).</li>
+            <li>Rev Ops visibility: they can see the autoforward status and are not required to act.</li>
+          </ul>
+        </div>
+
+        <div class="cob-path">
+          <div class="cob-path-header">
+            <span class="cob-path-num">Path 2</span>
+            <span class="cob-path-name">Auto-submit</span>
+            <span style="font-size:12px;color:var(--text-muted)">secondary on file, no autoforward</span>
+          </div>
+          <ul>
+            <li><strong>Trigger:</strong> ERA is <span class="era-code">PROCESSED_AS_PRIMARY</span> AND the member has a secondary insurance on file in TS backoffice.</li>
+            <li>TS system automatically creates a secondary claim using the primary ERA outcome data.</li>
+            <li>Submits to Trizetto for transmission to the secondary payer.</li>
+            <li>Sets Claim Create Date — Secondary, Claim Submit Date — Secondary, Secondary Claim Status = <code>processing</code>.</li>
+          </ul>
+        </div>
+
+        <div class="cob-path">
+          <div class="cob-path-header">
+            <span class="cob-path-num">Path 3</span>
+            <span class="cob-path-name">Manual Rev Ops submission</span>
+          </div>
+          <ul>
+            <li><strong>Trigger:</strong> Rev Ops initiates from backoffice when auto-submit did not fire or failed.</li>
+            <li>Backoffice exposes a "Submit Secondary Claim" action on the claim record.</li>
+            <li>Rev Ops can edit secondary insurance details before submitting.</li>
+            <li>Required for any case where the secondary payer or coverage is not yet in the TS system.</li>
+          </ul>
+        </div>
+
+        <div class="callout callout-info" style="margin-top:16px;">
+          <strong>Secondary claim data requirements</strong> Must include primary ERA data (primary payer paid amount, adjustment codes) as crossover claim information (loop 2330B in X12 837P). Must use the same provider NPI, taxonomy, and service line data as the primary claim.
+        </div>
+      </div>
+    </div>
+
+    <!-- D -->
+    <div id="req-d" class="req-block">
+      <div class="req-letter">D</div>
+      <div class="req-content">
+        <h3>Medicare Rate Table (Locality-Based Pricing)</h3>
+        <p><strong>Objective:</strong> Apply the correct Medicare locality rate to each claim at submission time. Today every claim is submitted at $224.46 regardless of MAC jurisdiction.</p>
+
+        <h4>Rate table design</h4>
+        <ul>
+          <li>Master table mapping ZIP code → locality → allowed amount (by CPT code where applicable).</li>
+          <li>Table covers all TS-active MAC jurisdictions.</li>
+          <li>Rate used on claim = provider home ZIP code lookup.</li>
+          <li>Net Revenue field in backoffice is populated from this table (not from ERA — ERA returns Allowed Amount, which is a separate field).</li>
+        </ul>
+
+        <h4>Rate selection logic</h4>
+        <ol>
+          <li>Look up provider home ZIP code on providers table.</li>
+          <li>Identify Medicare locality for that ZIP.</li>
+          <li>Apply locality-specific rate as Net Revenue.</li>
+        </ol>
+
+        <h4>Alert logic</h4>
+        <p>If Allowed Amount (from ERA) &gt; Net Revenue (from rate table), surface an alert to Rev Ops: <em>"ERA allowed amount exceeds expected rate for this locality — rate review recommended."</em></p>
+
+        <h4>Rate table maintenance <span class="scope-tag scope-tag-muted">v1 interim</span></h4>
+        <ul>
+          <li>CMS updates Medicare rates biannually (January and July).</li>
+          <li>In v1, rate table updates are a manual Rev Ops process. Owner TBD (see Open Questions).</li>
+          <li>SOX-compliant update workflow with audit trail is deferred to v2.</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- E -->
+    <div id="req-e" class="req-block">
+      <div class="req-letter">E</div>
+      <div class="req-content">
+        <h3>Medicaid / DUALS Detection and Billing Block</h3>
+        <div class="callout callout-danger">
+          <strong>Rule</strong> Members with Medicaid as primary or secondary insurance (including DUALS — Medicare + Medicaid) must never be billed out-of-pocket. Federal and state regulations prohibit balance-billing Medicaid beneficiaries.
+        </div>
+
+        <h4>v1 — Detection <span class="scope-tag">ships v1</span></h4>
+        <p>v1 has no automatic Stripe invoicing — Rev Ops manually invoices members. Detection surfaces a flag on the claim so Rev Ops knows <em>not</em> to invoice this member in Stripe.</p>
+        <ul>
+          <li><strong>Remark code on ERA:</strong> On any ERA (primary or secondary), scan RARC codes for Medicaid/DUALS indicators. If detected, flag the member as Medicaid/DUALS on the claim record in backoffice.</li>
+          <li>The flag is visible on the claim detail view. Rev Ops uses it as the signal to skip Stripe invoicing for this member.</li>
+          <li>Flag can also be set manually by Rev Ops on a member record (insurance or patient level).</li>
+        </ul>
+
+        <h4>v1.5 / v2 — Automatic billing block <span class="scope-tag scope-tag-muted">deferred</span></h4>
+        <p>Once automated Stripe invoicing is introduced, the Medicaid flag becomes an automatic billing block that suppresses invoice creation entirely.</p>
+        <ul>
+          <li>When block is active: Stripe invoice is suppressed. Member balance is set to $0.</li>
+          <li>Block applies to the current claim and all future claims for that member until explicitly removed.</li>
+          <li>Every block application and removal is logged with timestamp, actor, and trigger reason.</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- F -->
+    <div id="req-f" class="req-block">
+      <div class="req-letter">F</div>
+      <div class="req-content">
+        <h3>Member Balance Reconciliation</h3>
+        <p><strong>Objective:</strong> After each ERA (primary and secondary) is processed, the member's balance in backoffice reflects the correct patient responsibility — and Stripe invoicing (manual in v1) is based on that balance.</p>
+
+        <div class="formula-block">
+          Member balance = Billed Amount &minus; Primary Insurance Paid &minus; Secondary Insurance Paid &minus; Refunds/Takebacks
+        </div>
+
+        <h4>Update triggers</h4>
+        <ul>
+          <li>Primary ERA processed → update Primary Insurance Paid → recalculate balance.</li>
+          <li>Secondary ERA processed → update Secondary Insurance Paid → recalculate balance.</li>
+          <li>Manual secondary payment posted by Rev Ops → update Secondary Insurance Paid → recalculate balance.</li>
+          <li>Takeback/recoupment ERA received → update Refunds → recalculate balance.</li>
+          <li>Stripe payment received → reduce balance by payment amount.</li>
+        </ul>
+
+        <h4>Manual secondary payment posting</h4>
+        <p>Rev Ops can post a secondary payment manually from backoffice (for paper EOBs / lockbox payments that arrive outside the EDI path).</p>
+        <p><strong>Required fields:</strong> payment amount, payment date, payer, check/EFT reference.</p>
+
+        <h4>Stripe sync</h4>
+        <ul>
+          <li>When a member pays via Stripe from a Medicare invoice, the payment is reflected in the patient balance in backoffice.</li>
+          <li>When Rev Ops manually invoices a member, the resulting Stripe payment updates the claim-level patient balance.</li>
+          <li>Medicaid billing block (Section E) prevents Stripe invoice creation.</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- G -->
+    <div id="req-g" class="req-block">
+      <div class="req-letter">G</div>
+      <div class="req-content">
+        <h3>Backoffice UI — Rev Ops Views</h3>
+
+        <h4>Claim detail view</h4>
+        <ul>
+          <li>All fields from Section A visible on the claim record.</li>
+          <li>Primary and secondary ERA data visible side by side.</li>
+          <li>Claim status timeline: Primary Status, Secondary Status.</li>
+          <li>Actions: Submit Secondary Claim (Path 3), Post Manual Payment, Apply/Remove Billing Block.</li>
+        </ul>
+
+        <h4>Secondary insurance view / edit</h4>
+        <ul>
+          <li>Rev Ops can view secondary insurance on a member record: payer name, payer ID, member ID, group number, effective dates.</li>
+          <li>Rev Ops can add, edit, or remove secondary insurance from backoffice.</li>
+          <li>Source of truth for secondary insurance used in COB auto-submit (Path 2).</li>
+        </ul>
+
+        <h4>Medicare payer filter</h4>
+        <ul>
+          <li>All backoffice claim views support filtering by Medicare payers (Medicare + State).</li>
+          <li>Enables Rev Ops to isolate and monitor the Medicare book of business.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Happy Paths -->
+  <section id="happy-paths" class="prd-section">
+    <h2>Happy Paths</h2>
+
+    <!-- HP1 -->
+    <div class="happy-path">
+      <h3><span class="happy-path-num">1</span> Secondary with Autoforward</h3>
+      <p class="happy-path-desc">A Medicare member with supplemental insurance (e.g., Optum) has a session. MAC forwards the claim to Optum automatically.</p>
+      <table class="prd-table timeline-table">
+        <thead><tr><th>Step</th><th>Actor</th><th>Event</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>Member</td><td>Signs up with Medicare member ID; first session completed</td></tr>
+          <tr><td>2</td><td>TS</td><td>Submits claim 1234 at locality rate; Billed Amount: $224</td></tr>
+          <tr><td>3</td><td>MAC</td><td>Returns ERA: <span class="era-code">PROCESSED_AS_PRIMARY_FORWARDED</span>; paid $80; Allowed Amount: $100</td></tr>
+          <tr><td>4</td><td>TS system</td><td>Ingests ERA; sets: Primary Paid = $80, Allowed Amount = $100, ERA ID — Primary, Primary Claim Status = <code>completed</code>, Secondary Claim Status = <code>processing</code></td></tr>
+          <tr><td>5</td><td>TS system</td><td>Detects Allowed Amount ($100) = Net Revenue ($100) — no rate alert triggered</td></tr>
+          <tr><td>6</td><td>Optum</td><td>Returns secondary ERA: <span class="era-code">PROCESSED_AS_SECONDARY</span>; paid $20</td></tr>
+          <tr><td>7</td><td>TS system</td><td>Ingests secondary ERA; sets: Secondary Paid = $20, ERA ID — Secondary, Secondary Claim Status = <code>completed</code></td></tr>
+          <tr><td>8</td><td>TS system</td><td>Recalculates member balance: $224 &minus; $80 &minus; $20 = $0</td></tr>
+          <tr><td>9</td><td>Rev Ops</td><td>Reviews — no member invoice needed</td></tr>
+        </tbody>
+      </table>
+      <div class="state-snapshots">
+        <div class="state-snapshot">
+          <div class="state-snapshot-label">Backoffice after Step 4</div>
+          <table class="prd-table state-table">
+            <tbody>
+              <tr><td>Billed Amount</td><td>$224</td></tr>
+              <tr><td>Net Revenue</td><td>$100</td></tr>
+              <tr><td>Allowed Amount</td><td>$100</td></tr>
+              <tr><td>Primary Insurance Paid</td><td>$80</td></tr>
+              <tr><td>Secondary Insurance Paid</td><td>$0</td></tr>
+              <tr><td>Primary Claim Status</td><td><span class="badge-completed">completed</span></td></tr>
+              <tr><td>Secondary Claim Status</td><td><span class="badge-processing">processing</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="state-snapshot">
+          <div class="state-snapshot-label">Backoffice after Step 7</div>
+          <table class="prd-table state-table">
+            <tbody>
+              <tr><td>Primary Insurance Paid</td><td>$80</td></tr>
+              <tr><td>Secondary Insurance Paid</td><td>$20</td></tr>
+              <tr><td>Primary Claim Status</td><td><span class="badge-completed">completed</span></td></tr>
+              <tr><td>Secondary Claim Status</td><td><span class="badge-completed">completed</span></td></tr>
+              <tr><td>Member Balance</td><td><strong>$0</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="callout callout-info" style="margin-top:16px;">
+        <strong>Rate alert note</strong> If MAC returns Allowed Amount &gt; Net Revenue (locality rate), system alerts Rev Ops and triggers rate review before the pattern recurs on future claims.
+      </div>
+    </div>
+
+    <!-- HP2 -->
+    <div class="happy-path">
+      <h3><span class="happy-path-num">2</span> Primary Only</h3>
+      <p class="happy-path-desc">A Medicare member with no supplemental insurance. MAC pays primary; member owes remainder.</p>
+      <table class="prd-table timeline-table">
+        <thead><tr><th>Step</th><th>Actor</th><th>Event</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>Member</td><td>Signs up with Medicare only; session completed</td></tr>
+          <tr><td>2</td><td>TS</td><td>Submits claim 12345 at locality rate; Billed Amount: $224</td></tr>
+          <tr><td>3</td><td>MAC</td><td>Returns ERA: <span class="era-code">PROCESSED_AS_PRIMARY</span>; paid $80; Allowed Amount: $100</td></tr>
+          <tr><td>4</td><td>TS system</td><td>Ingests ERA. No secondary on file. No autoforward. Sets: Primary Paid = $80, Member Balance = $20 (member owes coinsurance)</td></tr>
+          <tr><td>5</td><td>Rev Ops</td><td>Reviews member balance; manually invoices member $20 via Stripe</td></tr>
+          <tr><td>6</td><td>Member</td><td>Pays $20 via Stripe</td></tr>
+          <tr><td>7</td><td>TS system</td><td>Stripe payment received; patient balance updated to $0</td></tr>
+        </tbody>
+      </table>
+      <div class="state-snapshots" style="grid-template-columns:1fr 1fr;">
+        <div class="state-snapshot">
+          <div class="state-snapshot-label">Backoffice after Step 4</div>
+          <table class="prd-table state-table">
+            <tbody>
+              <tr><td>Primary Insurance Paid</td><td>$80</td></tr>
+              <tr><td>Secondary Insurance Paid</td><td>n/a</td></tr>
+              <tr><td>Secondary Claim Status</td><td>null</td></tr>
+              <tr><td>Member Balance</td><td><strong>$20</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- HP3 -->
+    <div class="happy-path">
+      <h3><span class="happy-path-num">3</span> Secondary Does Not Autoforward</h3>
+      <p class="happy-path-desc">MAC returns <span class="era-code">PROCESSED_AS_PRIMARY</span> (no autoforward), but member has a secondary insurance on file in TS.</p>
+      <table class="prd-table timeline-table">
+        <thead><tr><th>Step</th><th>Actor</th><th>Event</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>Member</td><td>Has Medicare + secondary insurance on file in TS backoffice</td></tr>
+          <tr><td>2</td><td>TS</td><td>Submits primary claim 12345; Billed Amount: $224</td></tr>
+          <tr><td>3</td><td>MAC</td><td>Returns ERA: <span class="era-code">PROCESSED_AS_PRIMARY</span>; paid $80</td></tr>
+          <tr><td>4</td><td>TS system</td><td>Ingests ERA. Detects secondary insurance on file. No autoforward. Triggers auto-submit (COB Path 2). Creates secondary claim; sets Claim Create Date — Secondary, Claim Submit Date — Secondary, Secondary Claim Status = <code>processing</code></td></tr>
+          <tr><td>5</td><td>Secondary payer</td><td>Returns ERA: paid $15</td></tr>
+          <tr><td>6</td><td>TS system</td><td>Ingests secondary ERA; updates Secondary Insurance Paid = $15, Secondary Claim Status = <code>completed</code>; recalculates member balance</td></tr>
+          <tr><td>7</td><td>Rev Ops</td><td>Reviews balance; invoices or adjusts off remainder</td></tr>
+        </tbody>
+      </table>
+      <div class="state-snapshots" style="grid-template-columns:1fr 1fr;">
+        <div class="state-snapshot">
+          <div class="state-snapshot-label">Backoffice after Step 4</div>
+          <table class="prd-table state-table">
+            <tbody>
+              <tr><td>Primary Insurance Paid</td><td>$80</td></tr>
+              <tr><td>Secondary Insurance Paid</td><td>$0</td></tr>
+              <tr><td>Secondary Claim Status</td><td><span class="badge-processing">processing</span></td></tr>
+              <tr><td>Claim Submit Date — Secondary</td><td>[submitted date]</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <!-- HP4 -->
+    <div class="happy-path">
+      <h3><span class="happy-path-num">4</span> Secondary Does Not Autoforward — Rev Ops Adds Policy and Creates Claim</h3>
+      <p class="happy-path-desc">MAC returns <span class="era-code">PROCESSED_AS_PRIMARY</span> (no autoforward), and there is no secondary insurance on file in TS. Rev Ops manually adds the secondary policy, the system creates and submits the secondary claim, and it is stored for auto-submission on future claims.</p>
+      <table class="prd-table timeline-table">
+        <thead><tr><th>Step</th><th>Actor</th><th>Event</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>Member</td><td>Has Medicare only in TS backoffice; member has secondary insurance not yet entered in the system</td></tr>
+          <tr><td>2</td><td>TS</td><td>Submits primary claim 12345; Billed Amount: $224</td></tr>
+          <tr><td>3</td><td>MAC</td><td>Returns ERA: <span class="era-code">PROCESSED_AS_PRIMARY</span>; paid $80</td></tr>
+          <tr><td>4</td><td>Rev Ops</td><td>Reviews ERA. No secondary insurance on file in TS. No autoforward. Rev Ops manually adds the member's secondary policy in backoffice.</td></tr>
+          <tr><td>5</td><td>TS system</td><td>Creates secondary claim from the primary ERA outcome; sets Claim Create Date — Secondary, Claim Submit Date — Secondary, Secondary Claim Status = <code>processing</code></td></tr>
+          <tr><td>6</td><td>Secondary payer</td><td>Returns ERA: paid $15</td></tr>
+          <tr><td>7</td><td>TS system</td><td>Ingests secondary ERA; updates Secondary Insurance Paid = $15, Secondary Claim Status = <code>completed</code>; recalculates member balance</td></tr>
+          <tr><td>8</td><td>Rev Ops</td><td>Reviews balance; invoices or adjusts off remainder</td></tr>
+        </tbody>
+      </table>
+      <div class="callout callout-success" style="margin-top:16px;">
+        <strong>Going forward</strong> Now that the secondary policy is on file in TS, future claims for this member will trigger COB Path 2 (auto-submit) without Rev Ops intervention.
+      </div>
+    </div>
+
+  </section>
+
+  <!-- Configuration -->
+  <section id="config" class="prd-section">
+    <h2>Configuration</h2>
+    <p>Admin-configurable values that govern Medicare claims behavior without requiring a code deploy.</p>
+    <table class="prd-table">
+      <thead>
+        <tr><th>Config key</th><th>Type</th><th>Default</th><th>Purpose</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>MEDICARE_COB_AUTO_SUBMIT</code></td>
+          <td>Boolean</td>
+          <td><code>true</code></td>
+          <td>When true, system auto-submits secondary claim (Path 2) when secondary on file and ERA is <code>PROCESSED_AS_PRIMARY</code>. Kill switch for auto-submit if needed.</td>
+        </tr>
+        <tr>
+          <td><code>MEDICARE_STRIPE_BLOCK_MEDICAID_CODES</code></td>
+          <td>Array</td>
+          <td>See note</td>
+          <td>List of Medicaid remark codes that trigger automatic billing block at the member level. Updated outside SOX process in v1.</td>
+        </tr>
+        <tr>
+          <td><code>MEDICARE_ALLOWED_AMOUNT_ALERT_THRESHOLD</code></td>
+          <td>Boolean</td>
+          <td><code>true</code></td>
+          <td>When true, alert fires if ERA Allowed Amount exceeds Net Revenue. Can be toggled off during rate table updates.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- Success Metrics -->
+  <section id="metrics" class="prd-section">
+    <h2>Success Metrics</h2>
+    <h3>Primary</h3>
+    <div class="metrics-grid">
+      <div class="metric-card metric-primary">
+        <div class="metric-label">ERA association rate</div>
+        <div class="metric-target">&ge; 95%</div>
+        <div class="metric-desc">% of Medicare ERAs ingested and linked to a claim record in TS within 48 hours of receipt. Baseline today: 0%.</div>
+      </div>
+      <div class="metric-card metric-primary">
+        <div class="metric-label">Secondary claim submission rate</div>
+        <div class="metric-target">&ge; 90%</div>
+        <div class="metric-desc">% of eligible secondary claims (autoforward or secondary on file) submitted within 24 hours of primary ERA processing.</div>
+      </div>
+    </div>
+
+    <h3>Secondary</h3>
+    <ul>
+      <li>Rev Ops time per Medicare claim resolution — directional reduction vs. pre-launch baseline (proxy: claims worked per analyst per day)</li>
+      <li>Backoffice accuracy: member balance matches ERA outcome for &ge; 98% of processed claims</li>
+      <li>Medicaid block compliance: <strong>0</strong> Stripe invoices sent to DUALS members post-launch</li>
+    </ul>
+
+    <h3>Guardrails <span style="font-size:13px;font-weight:400;color:var(--text-muted)">— any breach triggers pause + investigation</span></h3>
+    <div class="guardrail-list">
+      <div class="guardrail-item">
+        <span class="guardrail-threshold">&ge; 10% relative increase</span>
+        <span class="guardrail-desc">Claim rejection rate from baseline after clearinghouse transition — may indicate submission format issues</span>
+      </div>
+      <div class="guardrail-item">
+        <span class="guardrail-threshold">&ge; 5% unmatched ERA rate</span>
+        <span class="guardrail-desc">ERAs received but not associated to a claim; indicates matching logic failure</span>
+      </div>
+      <div class="guardrail-item">
+        <span class="guardrail-threshold">&ge; 5% missing secondary submissions</span>
+        <span class="guardrail-desc">For eligible claims — auto-submit logic not firing as expected</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- Phasing -->
+  <section id="phasing" class="prd-section">
+    <h2>Phasing</h2>
+    <div class="phase-detail-grid">
+      <div class="phase-detail phase-detail-v1">
+        <div class="phase-detail-header">
+          <span class="phase-detail-tag">v1</span>
+          <span class="phase-detail-target">Target: Q4 2026 — replace Advantum</span>
+        </div>
+        <ul>
+          <li>ERA ingestion and primary ERA claim association</li>
+          <li>Secondary ERA processing</li>
+          <li>COB logic: Path 1 (detect autoforward), Path 2 (auto-submit), Path 3 (manual Rev Ops)</li>
+          <li>New backoffice fields (all fields in Section A)</li>
+          <li>Medicaid/DUALS billing block</li>
+          <li>Member balance reconciliation (primary + secondary)</li>
+          <li>Rev Ops secondary insurance view/edit in backoffice</li>
+          <li>Medicare payer filter in backoffice</li>
+          <li>Manual Stripe invoicing by Rev Ops</li>
+          <li>Locality rate table (populate Net Revenue; alert on Allowed Amount variance)</li>
+          <li>Full A/R reporting: takeback tracking, refund ledger, overpayment detection</li>
+          <li>Clearinghouse connection: Trizetto (same path as Advantum today)</li>
+        </ul>
+      </div>
+      <div class="phase-detail phase-detail-v2">
+        <div class="phase-detail-header">
+          <span class="phase-detail-tag">Later phases</span>
+          <span class="phase-detail-target">Post Q4 2026</span>
+        </div>
+        <ul>
+          <li>Eligibility verification on secondary policies</li>
+          <li>Member-facing billing center: members can view payments from both primary and secondary Medicare claims</li>
+          <li>Automated Stripe invoicing triggered by ERA outcome (zero-touch for fully-paid claims)</li>
+          <li>SOX-compliant CMS rate update workflow with change log, approvals, and audit trail</li>
+          <li>Account management model for Medicare members</li>
+          <li>Multi-policy support: members with more than two policies (e.g., primary Medicare + secondary plan + supplemental plan)</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Risks -->
+  <section id="risks" class="prd-section">
+    <h2>Risks</h2>
+    <table class="prd-table">
+      <thead>
+        <tr><th>Risk</th><th>Mitigation</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Clearinghouse transition issues</td><td>Stay on Trizetto (Advantum's current path) — no clearinghouse change in v1; minimizes transition risk</td></tr>
+        <tr><td>ERA matching failures (ERA does not contain enough claim identifiers to match in TS)</td><td>Validate matching logic in QA against a sample of real Medicare ERAs before launch; add unmatched ERA queue in backoffice</td></tr>
+        <tr><td>Secondary claim format errors (invalid COB/crossover data)</td><td>Test with Trizetto in staging; validate loop 2330B crossover data against real primary ERA samples</td></tr>
+        <tr><td>Medicaid DUALS member billed accidentally</td><td>Defense in depth: payer ID list + remark code detection + manual block; log all block decisions for audit</td></tr>
+        <tr><td>CMS rate table not updated biannually → wrong Net Revenue</td><td>Establish calendar reminders for January and July updates; v2 SOX workflow formalizes this</td></tr>
+        <tr><td>SOX compliance gap on rate table updates</td><td>v1 interim: manual process with Rev Ops ownership documented in runbook; v2 adds formal controls</td></tr>
+        <tr><td>1 FTE coverage gap (Advantum FTE no longer managing Medicare)</td><td>Rev Ops to hire or reassign 1 FTE to absorb Advantum's manual posting / denial management work pre-launch</td></tr>
+        <tr><td>Optum overpayment / takeback not captured</td><td>Refunds field captures ERA-based recoupments; paper/lockbox takebacks require manual Rev Ops post in v1</td></tr>
+        <tr><td>HIPAA — secondary insurance data exposure</td><td>Secondary insurance stored in TS under same PHI controls as primary; no new data categories introduced</td></tr>
+        <tr><td>Advantum contract wind-down overlap</td><td>Coordinate go-live date with Advantum contract end; plan for parallel run period (claims in flight at cutover)</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- Open Questions -->
+  <section id="open-questions" class="prd-section">
+    <h2>Open Questions</h2>
+
+    <h3>Resolved in scoping</h3>
+    <div class="oq-list" style="margin-bottom:24px;">
+      <div class="oq-item oq-resolved">
+        <span class="oq-badge oq-badge-resolved">✓</span>
+        <div class="oq-body"><strong>Clearinghouse:</strong> Stay on Trizetto — no clearinghouse change in v1.</div>
+      </div>
+      <div class="oq-item oq-resolved">
+        <span class="oq-badge oq-badge-resolved">✓</span>
+        <div class="oq-body"><strong>Rate basis:</strong> Provider home ZIP code used to determine locality rate.</div>
+      </div>
+      <div class="oq-item oq-resolved">
+        <span class="oq-badge oq-badge-resolved">✓</span>
+        <div class="oq-body"><strong>Medicaid block scope:</strong> Block at insurance and patient level; also triggered by remark code.</div>
+      </div>
+      <div class="oq-item oq-resolved">
+        <span class="oq-badge oq-badge-resolved">✓</span>
+        <div class="oq-body"><strong>Billed Amount:</strong> Remains $224.46 flat in v1; Net Revenue populated from locality rate table separately.</div>
+      </div>
+    </div>
+
+    <h3>Still open</h3>
+    <div class="oq-list">
+      <div class="oq-item">
+        <span class="oq-badge">1</span>
+        <div class="oq-body">SOX process for CMS rate updates — who owns it? Needs an owner assigned before launch. Rev Ops seems the natural home, but requires sign-off. Biannual updates (January, July) must be tracked.</div>
+      </div>
+      <div class="oq-item">
+        <span class="oq-badge">2</span>
+        <div class="oq-body">Advantum contract wind-down timeline. What is the notice period / contract end date? This is the external deadline constraint on v1 delivery.</div>
+      </div>
+      <div class="oq-item">
+        <span class="oq-badge">3</span>
+        <div class="oq-body">Secondary insurance data source for existing members. Members already in the TS system may not have secondary insurance entered in backoffice. What is the migration plan to populate this data for the active Medicare population before launch?</div>
+      </div>
+      <div class="oq-item">
+        <span class="oq-badge">4</span>
+        <div class="oq-body">Paper ERA / lockbox secondary payments — volume. Advantum posts paper secondary payments today. What is the monthly volume? This determines how much manual Rev Ops posting burden transfers in v1 vs. how much pressure there is to automate.</div>
+      </div>
+      <div class="oq-item">
+        <span class="oq-badge">5</span>
+        <div class="oq-body">When a member has more than two policies (e.g., primary Medicare + secondary plan + supplemental plan), how often does this occur in the current Medicare population? This determines whether multi-policy support needs to be pulled into v1.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Decisions Log -->
+  <section id="decisions" class="prd-section">
+    <h2>Decisions Log</h2>
+    <div class="decision-list">
+      <div class="decision-item">
+        <div class="decision-title">Clearinghouse (v1): Stay on Trizetto</div>
+        <div class="decision-rationale">Advantum already submits through Trizetto; reusing the same path reduces EDI format risk and clearinghouse onboarding delay.</div>
+      </div>
+      <div class="decision-item">
+        <div class="decision-title">Billed Amount: Keep at $224.46 flat in v1</div>
+        <div class="decision-rationale">Net Revenue is the locality-specific field for reporting. Changing the submitted billed amount is a separate pricing policy decision deferred to post-launch.</div>
+      </div>
+      <div class="decision-item">
+        <div class="decision-title">Stripe automation: Deferred to v2</div>
+        <div class="decision-rationale">Auto-invoicing requires confident balance calculation across multiple ERA outcomes; validated in v1, automated in v2. Rev Ops manually invoices members in v1.</div>
+      </div>
+      <div class="decision-item">
+        <div class="decision-title">COB Path 2 (auto-submit): System auto-submits secondary when secondary is on file + ERA is PROCESSED_AS_PRIMARY</div>
+        <div class="decision-rationale">Rev Ops can override. Reduces manual work on the highest-volume case.</div>
+      </div>
+      <div class="decision-item">
+        <div class="decision-title">Medicaid block — defense in depth</div>
+        <div class="decision-rationale">Block applied via payer ID list AND remark code detection AND manual flag. Any one trigger is sufficient. Compliance risk justifies redundancy.</div>
+      </div>
+      <div class="decision-item">
+        <div class="decision-title">Rate table alerts: Alert fires when Allowed Amount &gt; Net Revenue</div>
+        <div class="decision-rationale">Rev Ops reviews, not auto-adjusted. Rate discrepancies may indicate a table error, a provider assignment error, or a legitimate CMS change; human review appropriate before any action.</div>
+      </div>
+      <div class="decision-item">
+        <div class="decision-title">v1.5 — client-facing secondary insurance: Deferred</div>
+        <div class="decision-rationale">Rev Ops manages secondary insurance data in backoffice for v1. Backoffice coverage is sufficient for launch; client UX adds complexity without blocking v1 go-live.</div>
+      </div>
+      <div class="decision-item">
+        <div class="decision-title">Multiple payments per claim: Required from launch</div>
+        <div class="decision-rationale">Medicare + secondary + potential recoupments are a known multi-payment pattern; building this constraint in later would require schema migration.</div>
+      </div>
+      <div class="decision-item">
+        <div class="decision-title">DUALS member balance: Set to $0 once billing block applied</div>
+        <div class="decision-rationale">Member is never invoiced. Regulatory requirement.</div>
+      </div>
+    </div>
+  </section>
+
+</main>
+</body>
+</html>
