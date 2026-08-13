@@ -1047,3 +1047,79 @@ code {
   color: var(--text-muted);
   line-height: 1.5;
 }
+
+/* ─── Meeting notes ──────────────────────────────────── */
+
+.meeting-note {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  margin-bottom: 24px;
+}
+
+.meeting-note-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.meeting-note-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.meeting-note-date {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-family: 'SF Mono', 'Fira Mono', monospace;
+}
+
+.meeting-note-lede {
+  font-size: 13px;
+  color: var(--text-muted);
+  font-style: italic;
+  margin: 12px 16px 4px;
+}
+
+.meeting-note-list {
+  list-style: none;
+  padding: 8px 16px 16px;
+  margin: 0;
+}
+
+.meeting-note-list li {
+  font-size: 14px;
+  color: var(--text-soft);
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-light);
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  line-height: 1.5;
+}
+
+.meeting-note-list li:last-child { border-bottom: none; }
+
+.note-flag {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 4px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.note-flag-question { background: var(--info-light); color: #1E40AF; }
+.note-flag-feature { background: var(--primary-light); color: var(--primary-dark); }
+.note-flag-eng { background: var(--bg); color: var(--text-muted); border: 1px solid var(--border); }
+.note-flag-scope { background: var(--warning-light); color: #92400E; }
+.note-flag-prd { background: var(--danger-light); color: #991B1B; }
+.note-flag-defer { background: var(--bg); color: var(--text-muted); border: 1px solid var(--border); }

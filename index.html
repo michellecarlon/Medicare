@@ -35,6 +35,7 @@
     <li><a href="#risks" class="nav-link">Risks</a></li>
     <li><a href="#open-questions" class="nav-link">Open Questions</a></li>
     <li><a href="#decisions" class="nav-link">Decisions Log</a></li>
+    <li><a href="#meeting-notes" class="nav-link">Meeting Notes</a></li>
   </ul>
 </nav>
 
@@ -60,11 +61,11 @@
   <div class="phase-bar">
     <div class="phase-chip phase-v1">
       <div class="phase-label">v1 — Ship first</div>
-      <div class="phase-items">ERA processing &middot; COB claim lifecycle &middot; Backoffice fields (billed amount + secondary fields) &middot; Locality rate table &middot; Flag member as Medicaid &middot; Manual Stripe invoicing &middot; Full A/R reporting (takebacks, refunds, overpayment detection)</div>
+      <div class="phase-items">ERA processing &middot; COB claim lifecycle &middot; Backoffice fields (billed amount + secondary fields) &middot; Flag member as Medicaid &middot; Manual Stripe invoicing &middot; Full A/R reporting (takebacks, refunds, overpayment detection)</div>
     </div>
     <div class="phase-chip phase-v2">
       <div class="phase-label">Later phases</div>
-      <div class="phase-items">Eligibility verification on secondary &middot; Member-facing billing center &middot; Auto Stripe invoicing &middot; Auto Medicaid billing block &middot; SOX rate update workflow &middot; Multi-policy support (primary Medicare + secondary + supplemental)</div>
+      <div class="phase-items">Locality rate table &middot; Eligibility verification on secondary &middot; Member-facing billing center &middot; Auto Stripe invoicing &middot; Medicaid/DUALS billing block &middot; SOX rate update workflow &middot; Multi-policy support (primary Medicare + secondary + supplemental)</div>
     </div>
   </div>
 
@@ -76,7 +77,6 @@
     <ol class="goal-list">
       <li><strong>Ingest and process Medicare ERAs</strong> inside the TS claims system. Associate primary and secondary ERA data to the originating claim and expose it in backoffice.</li>
       <li><strong>Manage Coordination of Benefits (COB)</strong> — create and submit secondary/supplemental claims triggered by primary ERA outcome (autoforward detected, or secondary on file with no autoforward).</li>
-      <li><strong>Apply locality-based Medicare rates</strong> from a master rate table, using provider home zip code to determine the correct allowed amount for each claim.</li>
     </ol>
     <div class="callout callout-success">
       <strong>Net effect</strong> Advantum is fully replaced for Medicare claims. Rev Ops gains real-time visibility into claim status, ERA associations, and member balances for both primary and secondary insurance. One vendor relationship is eliminated and one Rev Ops FTE currently absorbed by Advantum is redirected to managing the process in-house.
@@ -188,10 +188,9 @@
     <ol class="goal-list">
       <li><strong>ERA processing:</strong> Every Medicare ERA (primary and secondary/supplemental) is processed into the TS system and associated to the originating claim in the database.</li>
       <li><strong>COB / secondary claims:</strong> TS creates and submits secondary/supplemental claims triggered by primary ERA outcome (autoforward detected, or secondary on file with no autoforward). Add the ability to manually generate claims out of backoffice.</li>
-      <li><strong>Locality rates:</strong> All Medicare claims are submitted at the standard billed amount, but the system tracks the locality-specific allowed amount based on provider home zip code.</li>
-      <li><strong>Medicaid detection &amp; block:</strong> Members identified as Medicaid or DUALS are flagged in backoffice. They will never be invoiced via Stripe. The flag is applied automatically from remark codes and can be set manually at the insurance or patient level.</li>
       <li><strong>Backoffice visibility:</strong> Rev Ops can view and manage all Medicare claim fields — primary and secondary — in backoffice without leaving the TS system. Rev Ops can manually post ERAs and tag them as primary or secondary.</li>
-      <li><strong>A/R reporting:</strong> Full Medicare-specific accounts receivable visibility in TS, including takebacks, refunds, overpayment detection, and multi-payment history.</li>
+      <li><strong>A/R reporting:</strong> Full Medicare-specific accounts receivable visibility in TS, including takebacks, refunds, overpayment detection, and multi-payment history. Member balance is updated to reflect primary and secondary claims, and manual Stripe invoices.</li>
+      <li><strong>Medicaid detection &amp; block:</strong> Members identified as Medicaid or DUALS are flagged in backoffice. They will never be invoiced via Stripe. The flag is applied automatically from remark codes and can be set manually at the insurance or patient level.</li>
     </ol>
 
     <h3>Non-Goals <span class="scope-tag scope-tag-muted">v1</span></h3>
@@ -199,7 +198,7 @@
       <li>Client-facing secondary insurance add/update — deferred to later phases</li>
       <li>Automated Stripe invoicing on claim outcome — deferred to later phases (Rev Ops manually invoices in v1)</li>
       <li>SOX-process tooling for biannual CMS rate updates — deferred to later phases; interim process is manual with Rev Ops ownership</li>
-      <li>Eligibility verification on secondary policies — deferred to later phases</li>
+      <li>True Coordination of Benefits: Eligibility verification on secondary policies — deferred to later phases</li>
       <li>Non-Medicare payers — rate table infrastructure benefits BCBS and TRICARE but payer-specific logic is out of v1 scope</li>
     </ul>
   </section>
@@ -362,6 +361,12 @@
               <td>RARC code; also used for Medicaid block trigger</td>
             </tr>
             <tr>
+              <td>Claim Create Reason — Secondary <span class="badge-new">new</span></td>
+              <td>Enum</td>
+              <td>TS system</td>
+              <td>How the secondary claim was created: <code>autoforward</code> · <code>known_secondary</code> · <code>manual</code></td>
+            </tr>
+            <tr>
               <td>Primary Claim Status <span class="badge-existing">existing</span></td>
               <td>Enum</td>
               <td>Primary ERA</td>
@@ -484,7 +489,7 @@
     <div id="req-d" class="req-block">
       <div class="req-letter">D</div>
       <div class="req-content">
-        <h3>Medicare Rate Table (Locality-Based Pricing)</h3>
+        <h3>Medicare Rate Table (Locality-Based Pricing) <span class="scope-tag scope-tag-muted">Later phases</span></h3>
         <p><strong>Objective:</strong> Apply the correct Medicare locality rate to each claim at submission time. Today every claim is submitted at $224.46 regardless of MAC jurisdiction.</p>
 
         <h4>Rate table design</h4>
@@ -762,8 +767,8 @@
         <tr>
           <td><code>MEDICARE_STRIPE_BLOCK_MEDICAID_CODES</code></td>
           <td>Array</td>
-          <td>See note</td>
-          <td>List of Medicaid remark codes that trigger automatic billing block at the member level. Updated outside SOX process in v1.</td>
+          <td>none</td>
+          <td>List of Medicaid remark codes that trigger a flag on the patient and claim and the automatic billing block at the member level. Updated outside SOX process in v1.</td>
         </tr>
         <tr>
           <td><code>MEDICARE_ALLOWED_AMOUNT_ALERT_THRESHOLD</code></td>
@@ -830,12 +835,11 @@
           <li>Secondary ERA processing</li>
           <li>COB logic: Path 1 (detect autoforward), Path 2 (auto-submit), Path 3 (manual Rev Ops)</li>
           <li>New backoffice fields (all fields in Section A)</li>
-          <li>Medicaid/DUALS billing block</li>
+          <li>Medicaid/DUALS billing detection and flag</li>
           <li>Member balance reconciliation (primary + secondary)</li>
           <li>Rev Ops secondary insurance view/edit in backoffice</li>
           <li>Medicare payer filter in backoffice</li>
           <li>Manual Stripe invoicing by Rev Ops</li>
-          <li>Locality rate table (populate Net Revenue; alert on Allowed Amount variance)</li>
           <li>Full A/R reporting: takeback tracking, refund ledger, overpayment detection</li>
           <li>Clearinghouse connection: Trizetto (same path as Advantum today)</li>
         </ul>
@@ -849,6 +853,7 @@
           <li>Eligibility verification on secondary policies</li>
           <li>Member-facing billing center: members can view payments from both primary and secondary Medicare claims</li>
           <li>Automated Stripe invoicing triggered by ERA outcome (zero-touch for fully-paid claims)</li>
+          <li>Medicaid/DUALS billing block: automatic invoice suppression at member level</li>
           <li>SOX-compliant CMS rate update workflow with change log, approvals, and audit trail</li>
           <li>Account management model for Medicare members</li>
           <li>Multi-policy support: members with more than two policies (e.g., primary Medicare + secondary plan + supplemental plan)</li>
@@ -925,6 +930,10 @@
         <span class="oq-badge">5</span>
         <div class="oq-body">When a member has more than two policies (e.g., primary Medicare + secondary plan + supplemental plan), how often does this occur in the current Medicare population? This determines whether multi-policy support needs to be pulled into v1.</div>
       </div>
+      <div class="oq-item">
+        <span class="oq-badge">6</span>
+        <div class="oq-body"><strong>Open Business Decision:</strong> How do we want to handle Medicaid DUAL members? Always consider as in-network?</div>
+      </div>
     </div>
   </section>
 
@@ -968,6 +977,31 @@
         <div class="decision-title">DUALS member balance: Set to $0 once billing block applied</div>
         <div class="decision-rationale">Member is never invoiced. Regulatory requirement.</div>
       </div>
+    </div>
+  </section>
+
+  <!-- Meeting Notes -->
+  <section id="meeting-notes" class="prd-section">
+    <h2>Meeting Notes</h2>
+
+    <div class="meeting-note">
+      <div class="meeting-note-header">
+        <span class="meeting-note-title">Yaeer Meeting</span>
+        <span class="meeting-note-date">2026-08-13</span>
+      </div>
+      <p class="meeting-note-lede">Items below need to be reviewed and incorporated into the PRD. Not yet triaged.</p>
+      <ul class="meeting-note-list">
+        <li><span class="note-flag note-flag-question">Verify</span> ERA processing may already be happening and fields may already exist in the system — confirm current state before scoping ERA ingestion work.</li>
+        <li><span class="note-flag note-flag-feature">Feature</span> Rev Ops needs the ability on a claim to resubmit to a secondary payer.</li>
+        <li><span class="note-flag note-flag-feature">Feature</span> Registration flow must capture secondary insurance info — confirm this is in scope and not already broken.</li>
+        <li><span class="note-flag note-flag-eng">Eng</span> Use <code>admin_consolidation</code> feature flag in backoffice to handle member billing.</li>
+        <li><span class="note-flag note-flag-scope">Scope change</span> Move member billing and Medicaid block to v1. This will be fully automated — no manual Rev Ops billing step.</li>
+        <li><span class="note-flag note-flag-eng">Eng</span> Kill switch feature flag to stop all billing at the patient level — takes <code>user_id</code> as input.</li>
+        <li><span class="note-flag note-flag-prd">Needs own PRD</span> Remark codes configuration must be built in parallel — a cross-payer config layer that defines WHICH field drives the Medicaid billing block. When a matching code is detected, the member is added to the billing block kill switch.</li>
+        <li><span class="note-flag note-flag-question">Verify</span> Need specific information on how a secondary claim gets submitted and what the format is for a secondary claim.</li>
+        <li><span class="note-flag note-flag-question">Think through</span> Edge cases — what happens when you resubmit a primary claim?</li>
+        <li><span class="note-flag note-flag-defer">Separate discussion</span> Takeback refunds — what is Rev Ops missing today? Scope TBD.</li>
+      </ul>
     </div>
   </section>
 
